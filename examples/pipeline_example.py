@@ -5,9 +5,9 @@ multiple technical analysis indicators together.
 """
 
 import polars as pl
+from ml4t.engineer.features.ta import create_ta_pipeline_step, rsi, sma, ta_step
 
 from ml4t.engineer import pipeline
-from ml4t.engineer.features.ta import create_ta_pipeline_step, rsi, sma, ta_step
 
 # Create sample data
 data = pl.DataFrame(
