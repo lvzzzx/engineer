@@ -223,6 +223,19 @@ class TestSaveFeatures:
         with pytest.raises(TypeError, match="must be a Polars DataFrame"):
             store_memory.save_features({"not": "a dataframe"}, "test")
 
+    def test_save_labels_alias(self, store_memory, sample_labels):
+        """Test saving labels with explicit semantic intent."""
+        store_memory.save_labels(sample_labels, "forward_returns")
+
+        loaded = store_memory.load_features("forward_returns")
+        assert loaded.shape == sample_labels.shape
+        assert set(loaded.columns) == set(sample_labels.columns)
+
+    def test_save_invalid_table_identifier_raises_error(self, store_memory, sample_features):
+        """Test rejecting table names that cannot be safely referenced by SQL."""
+        with pytest.raises(ValueError, match="valid SQL identifier"):
+            store_memory.save_features(sample_features, "bad-table")
+
 
 # ============================================================================
 # load_features() Tests
@@ -405,6 +418,66 @@ class TestPointInTimeJoin:
         result = store_memory.point_in_time_join(labels, "features", tolerance="3h")
         assert result["rsi_14"][0] == 55.0
 
+    def test_join_with_feature_timestamp_column_and_column_pushdown(self, store_memory):
+        """Test PIT joins against sparse artifacts keyed by availability time."""
+        features = pl.DataFrame(
+            {
+                "available_at": ["2024-01-01", "2024-03-01", "2024-06-01"],
+                "symbol": ["AAPL", "AAPL", "AAPL"],
+                "roa": [0.10, 0.12, 0.08],
+                "accruals": [0.01, 0.02, 0.03],
+            }
+        )
+        labels = pl.DataFrame(
+            {
+                "timestamp": ["2024-02-15", "2024-05-15"],
+                "symbol": ["AAPL", "AAPL"],
+                "target": [1, 0],
+            }
+        )
+
+        store_memory.save_features(features, "accounting_features")
+        result = store_memory.point_in_time_join(
+            labels,
+            "accounting_features",
+            join_keys=["symbol"],
+            feature_timestamp_col="available_at",
+            columns=["roa"],
+        )
+
+        assert result["roa"].to_list() == [0.10, 0.12]
+        assert "accruals" not in result.columns
+
+    def test_join_with_feature_filter_pushdown(self, store_memory):
+        """Test filtering feature artifacts before PIT joining."""
+        features = pl.DataFrame(
+            {
+                "available_at": ["2024-01-01", "2024-03-01"],
+                "symbol": ["AAPL", "AAPL"],
+                "roa": [0.10, 0.12],
+                "quality_ok": [False, True],
+            }
+        )
+        labels = pl.DataFrame(
+            {
+                "timestamp": ["2024-02-15", "2024-05-15"],
+                "symbol": ["AAPL", "AAPL"],
+                "target": [1, 0],
+            }
+        )
+
+        store_memory.save_features(features, "accounting_features")
+        result = store_memory.point_in_time_join(
+            labels,
+            "accounting_features",
+            join_keys=["symbol"],
+            feature_timestamp_col="available_at",
+            columns=["roa"],
+            filter_expr="quality_ok",
+        )
+
+        assert result["roa"].to_list() == [None, 0.12]
+
     def test_join_no_matching_features(self, store_memory):
         """Test join when no features match (future labels)."""
         # Features in the past
@@ -469,6 +542,84 @@ class TestPointInTimeJoin:
         """Test join with wrong type raises error."""
         with pytest.raises(TypeError, match="must be a Polars DataFrame"):
             store_memory.point_in_time_join({"not": "dataframe"}, "features")
+
+
+# ============================================================================
+# exact_join() Tests
+# ============================================================================
+
+
+class TestExactJoin:
+    """Test exact panel joins."""
+
+    def test_exact_join_dataframe_left(self, store_memory):
+        """Test joining labels to dense features on exact asset/time keys."""
+        labels = pl.DataFrame(
+            {
+                "timestamp": ["2024-01-01", "2024-01-02"],
+                "symbol": ["AAPL", "AAPL"],
+                "target": [1, 0],
+            }
+        )
+        features = pl.DataFrame(
+            {
+                "timestamp": ["2024-01-01", "2024-01-02"],
+                "symbol": ["AAPL", "AAPL"],
+                "rsi_14": [55.0, 60.0],
+                "macd": [0.5, 0.7],
+            }
+        )
+
+        store_memory.save_features(features, "daily_features")
+        result = store_memory.exact_join(
+            labels,
+            "daily_features",
+            on=["symbol", "timestamp"],
+            columns=["rsi_14"],
+        )
+
+        assert result.columns == ["timestamp", "symbol", "target", "rsi_14"]
+        assert result["rsi_14"].to_list() == [55.0, 60.0]
+        assert "macd" not in result.columns
+
+    def test_exact_join_stored_left(self, store_memory):
+        """Test exact joining two stored artifacts."""
+        labels = pl.DataFrame(
+            {
+                "timestamp": ["2024-01-01", "2024-01-02"],
+                "symbol": ["AAPL", "AAPL"],
+                "target": [1, 0],
+            }
+        )
+        features = pl.DataFrame(
+            {
+                "timestamp": ["2024-01-01", "2024-01-02"],
+                "symbol": ["AAPL", "AAPL"],
+                "rsi_14": [55.0, 60.0],
+            }
+        )
+
+        store_memory.save_labels(labels, "labels")
+        store_memory.save_features(features, "daily_features")
+        result = store_memory.exact_join(
+            "labels",
+            "daily_features",
+            on=["symbol", "timestamp"],
+        )
+
+        assert result.select("target", "rsi_14").to_dict(as_series=False) == {
+            "target": [1, 0],
+            "rsi_14": [55.0, 60.0],
+        }
+
+    def test_exact_join_missing_key_raises_error(self, store_memory):
+        """Test clear errors when panel join keys are missing."""
+        labels = pl.DataFrame({"timestamp": ["2024-01-01"], "target": [1]})
+        features = pl.DataFrame({"timestamp": ["2024-01-01"], "symbol": ["AAPL"]})
+
+        store_memory.save_features(features, "daily_features")
+        with pytest.raises(ValueError, match="join keys"):
+            store_memory.exact_join(labels, "daily_features", on=["symbol", "timestamp"])
 
 
 # ============================================================================

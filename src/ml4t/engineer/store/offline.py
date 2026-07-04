@@ -23,9 +23,10 @@ Design Philosophy:
 4. Correctness: Point-in-time joins prevent data leakage
 """
 
+import re
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 try:
     import duckdb
@@ -50,6 +51,53 @@ if TYPE_CHECKING:
 
 class FeatureStoreError(Exception):
     """Raised when feature store operations fail."""
+
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+ArtifactKind = Literal["features", "labels", "targets", "artifact"]
+
+
+def _quote_identifier(identifier: str) -> str:
+    if not isinstance(identifier, str) or not identifier:
+        raise ValueError("identifier must be a non-empty string")
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _validate_table_name(table_name: str) -> None:
+    if not table_name or not isinstance(table_name, str):
+        raise ValueError("table_name must be a non-empty string")
+    if not _IDENTIFIER_RE.match(table_name):
+        raise ValueError(
+            "table_name must be a valid SQL identifier containing only letters, "
+            "numbers, and underscores, and may not start with a number"
+        )
+
+
+def _validate_columns(columns: list[str] | None) -> None:
+    if columns is None:
+        return
+    if not isinstance(columns, list):
+        raise TypeError("columns must be a list of strings")
+    if len(columns) == 0:
+        raise ValueError("columns list cannot be empty")
+    if not all(isinstance(col, str) and col for col in columns):
+        raise TypeError("all columns must be non-empty strings")
+
+
+def _select_clause(columns: list[str] | None) -> str:
+    return "*" if columns is None else ", ".join(_quote_identifier(col) for col in columns)
+
+
+def _as_polars_frame(value: "pl.DataFrame | str", *, name: str) -> "pl.DataFrame | str":
+    if isinstance(value, str):
+        if not value:
+            raise ValueError(f"{name} table name must be a non-empty string")
+        return value
+    if not isinstance(value, pl.DataFrame):
+        raise TypeError(f"{name} must be a Polars DataFrame or table name")
+    if value.is_empty():
+        raise ValueError(f"{name} DataFrame cannot be empty")
+    return value
 
 
 class OfflineFeatureStore:
@@ -246,6 +294,7 @@ class OfflineFeatureStore:
             >>> store.table_exists("my_features")
             True
         """
+        _validate_table_name(table_name)
         return table_name in self.list_tables()
 
     def execute(self, query: str) -> "duckdb.DuckDBPyRelation":
@@ -288,41 +337,59 @@ class OfflineFeatureStore:
             >>> store.save_features(df, "rsi_features")
             >>> store.save_features(df2, "rsi_features", mode="append")
         """
-        # Validate inputs
+        self.save_artifact(df, table_name, mode=mode, kind="features")
+
+    def save_labels(
+        self,
+        df: "pl.DataFrame",
+        table_name: str,
+        mode: str = "replace",
+    ) -> None:
+        """Save supervised labels or targets to DuckDB.
+
+        This mirrors :meth:`save_features` but keeps the caller's intent clear
+        when the table stores labels rather than model inputs.
+        """
+        self.save_artifact(df, table_name, mode=mode, kind="labels")
+
+    def save_artifact(
+        self,
+        df: "pl.DataFrame",
+        table_name: str,
+        mode: str = "replace",
+        *,
+        kind: ArtifactKind = "artifact",
+    ) -> None:
+        """Save a feature, label, target, or generic artifact table to DuckDB."""
         if not isinstance(df, pl.DataFrame):
             raise TypeError(f"df must be a Polars DataFrame, got {type(df).__name__}")
 
         if df.is_empty():
             raise ValueError("Cannot save empty DataFrame")
 
-        if not table_name or not isinstance(table_name, str):
-            raise ValueError("table_name must be a non-empty string")
+        _validate_table_name(table_name)
 
         if mode not in ("replace", "append", "fail"):
             raise ValueError(f"mode must be 'replace', 'append', or 'fail', got '{mode}'")
+        if kind not in ("features", "labels", "targets", "artifact"):
+            raise ValueError("kind must be one of: 'features', 'labels', 'targets', or 'artifact'")
 
-        # Check table existence
         exists = self.table_exists(table_name)
+        quoted_table = _quote_identifier(table_name)
 
-        # Handle mode="fail"
         if mode == "fail" and exists:
             raise FeatureStoreError(f"Table '{table_name}' already exists and mode='fail'")
 
-        # Drop table if mode="replace"
         if mode == "replace" and exists:
-            self.connection.execute(f"DROP TABLE {table_name}")
+            self.connection.execute(f"DROP TABLE {quoted_table}")
 
-        # Save using Arrow zero-copy
-        # DuckDB can read directly from Arrow without copying
         try:
             if mode == "append" and exists:
-                # Insert into existing table
-                self.connection.execute(f"INSERT INTO {table_name} SELECT * FROM df")
+                self.connection.execute(f"INSERT INTO {quoted_table} SELECT * FROM df")
             else:
-                # Create new table from DataFrame
-                self.connection.execute(f"CREATE TABLE {table_name} AS SELECT * FROM df")
+                self.connection.execute(f"CREATE TABLE {quoted_table} AS SELECT * FROM df")
         except Exception as e:
-            raise FeatureStoreError(f"Failed to save features to '{table_name}': {e}") from e
+            raise FeatureStoreError(f"Failed to save {kind} to '{table_name}': {e}") from e
 
     def load_features(
         self,
@@ -360,24 +427,16 @@ class OfflineFeatureStore:
             >>> # Load recent data with limit
             >>> df = store.load_features("rsi_features", limit=1000)
         """
-        # Validate table exists
+        _validate_table_name(table_name)
+
         if not self.table_exists(table_name):
             raise FeatureStoreError(
                 f"Table '{table_name}' does not exist. Available tables: {self.list_tables()}"
             )
 
-        # Validate columns
-        if columns is not None:
-            if not isinstance(columns, list):
-                raise TypeError("columns must be a list of strings")
-            if len(columns) == 0:
-                raise ValueError("columns list cannot be empty")
-            if not all(isinstance(col, str) for col in columns):
-                raise TypeError("all columns must be strings")
+        _validate_columns(columns)
 
-        # Build SQL query
-        select_clause = "*" if columns is None else ", ".join(columns)
-        query = f"SELECT {select_clause} FROM {table_name}"
+        query = f"SELECT {_select_clause(columns)} FROM {_quote_identifier(table_name)}"
 
         # Add WHERE clause if provided
         if filter_expr:
@@ -399,6 +458,82 @@ class OfflineFeatureStore:
         except Exception as e:
             raise FeatureStoreError(f"Failed to load features from '{table_name}': {e}") from e
 
+    def exact_join(
+        self,
+        left: "pl.DataFrame | str",
+        right_table: str,
+        on: list[str],
+        *,
+        columns: list[str] | None = None,
+        filter_expr: str | None = None,
+        how: str = "inner",
+    ) -> "pl.DataFrame":
+        """Join a DataFrame or stored table to another stored table by exact keys.
+
+        This is the right tool for dense panel artifacts where features and
+        labels share the same asset/time grain, for example ``symbol`` and
+        ``timestamp``.
+        """
+        left = _as_polars_frame(left, name="left")
+        if not isinstance(on, list) or not on:
+            raise ValueError("on must be a non-empty list of column names")
+        if not all(isinstance(col, str) and col for col in on):
+            raise TypeError("all join keys must be non-empty strings")
+        if how not in ("inner", "left", "outer", "semi", "anti"):
+            raise ValueError("how must be one of: 'inner', 'left', 'outer', 'semi', 'anti'")
+        _validate_columns(columns)
+        right_load_columns = None if columns is None else list(dict.fromkeys([*on, *columns]))
+
+        if isinstance(left, pl.DataFrame):
+            missing = [key for key in on if key not in left.columns]
+            if missing:
+                raise ValueError(f"join keys {missing} not found in left DataFrame")
+            right = self.load_features(
+                right_table,
+                columns=right_load_columns,
+                filter_expr=filter_expr,
+            )
+            missing = [key for key in on if key not in right.columns]
+            if missing:
+                raise ValueError(f"join keys {missing} not found in right table '{right_table}'")
+            return left.join(right, on=on, how=how)
+
+        self._validate_table_exists(left, label="left")
+        self._validate_table_exists(right_table, label="right")
+        right_cols = self._table_columns(right_table)
+        right_select_cols = right_cols if columns is None else columns
+        missing = [key for key in on if key not in self._table_columns(left)]
+        if missing:
+            raise ValueError(f"join keys {missing} not found in left table '{left}'")
+        missing = [key for key in on if key not in right_cols]
+        if missing:
+            raise ValueError(f"join keys {missing} not found in right table '{right_table}'")
+
+        left_alias = "l"
+        right_alias = "r"
+        select_cols = [f"{left_alias}.*"]
+        select_cols.extend(
+            f"{right_alias}.{_quote_identifier(col)}" for col in right_select_cols if col not in on
+        )
+        join_predicate = " AND ".join(
+            f"{left_alias}.{_quote_identifier(key)} = {right_alias}.{_quote_identifier(key)}"
+            for key in on
+        )
+        join_type = "FULL OUTER" if how == "outer" else how.upper()
+        filter_sql = f" AND ({filter_expr})" if filter_expr else ""
+        query = (
+            f"SELECT {', '.join(select_cols)} "
+            f"FROM {_quote_identifier(left)} AS {left_alias} "
+            f"{join_type} JOIN {_quote_identifier(right_table)} AS {right_alias} "
+            f"ON {join_predicate}{filter_sql}"
+        )
+        try:
+            return self.connection.execute(query).pl()
+        except Exception as e:
+            raise FeatureStoreError(
+                f"Failed to exact join '{left}' with '{right_table}': {e}"
+            ) from e
+
     def point_in_time_join(
         self,
         labels: "pl.DataFrame",
@@ -406,6 +541,9 @@ class OfflineFeatureStore:
         timestamp_col: str = "timestamp",
         join_keys: list[str] | None = None,
         tolerance: str | None = None,
+        feature_timestamp_col: str | None = None,
+        columns: list[str] | None = None,
+        filter_expr: str | None = None,
     ) -> "pl.DataFrame":
         """Perform point-in-time correct join to prevent data leakage.
 
@@ -421,6 +559,12 @@ class OfflineFeatureStore:
                 If None, joins only on time
             tolerance: Optional time tolerance (e.g., "1h", "1d")
                 Maximum time difference allowed for a match
+            feature_timestamp_col: Optional timestamp column in the feature table.
+                Defaults to ``timestamp_col``. Use this for feature artifacts keyed
+                by availability time such as ``available_at``.
+            columns: Optional columns to load from the feature table. Join keys and
+                timestamp columns are added automatically when omitted.
+            filter_expr: Optional SQL WHERE clause pushed down before loading features.
 
         Returns:
             Polars DataFrame with labels and point-in-time correct features
@@ -458,28 +602,22 @@ class OfflineFeatureStore:
 
             This is critical for backtesting to avoid data leakage.
         """
-        # Validate labels DataFrame
         if not isinstance(labels, pl.DataFrame):
             raise TypeError(f"labels must be a Polars DataFrame, got {type(labels).__name__}")
 
         if labels.is_empty():
             raise ValueError("labels DataFrame cannot be empty")
 
-        # Validate timestamp column exists in labels
         if timestamp_col not in labels.columns:
             raise ValueError(
                 f"timestamp column '{timestamp_col}' not found in labels. "
                 f"Available columns: {labels.columns}"
             )
 
-        # Validate features table exists
-        if not self.table_exists(features_table):
-            raise FeatureStoreError(
-                f"Features table '{features_table}' does not exist. "
-                f"Available tables: {self.list_tables()}"
-            )
+        self._validate_table_exists(features_table, label="features")
+        feature_timestamp_col = feature_timestamp_col or timestamp_col
+        _validate_columns(columns)
 
-        # Validate join_keys exist in labels if provided
         if join_keys:
             if not isinstance(join_keys, list):
                 raise TypeError("join_keys must be a list of strings")
@@ -489,24 +627,36 @@ class OfflineFeatureStore:
                     f"join_keys {missing_keys} not found in labels. "
                     f"Available columns: {labels.columns}"
                 )
+        else:
+            join_keys = []
 
-        # Load features from DuckDB and use Polars native join_asof
-        # This is simpler, more readable, and leverages Polars' optimized temporal join
+        feature_columns = self._table_columns(features_table)
+        required_feature_cols = [*join_keys, feature_timestamp_col]
+        missing_feature_cols = [col for col in required_feature_cols if col not in feature_columns]
+        if missing_feature_cols:
+            raise ValueError(
+                f"feature columns {missing_feature_cols} not found in '{features_table}'. "
+                f"Available columns: {feature_columns}"
+            )
+
+        load_columns = columns
+        if load_columns is not None:
+            load_columns = list(dict.fromkeys([*required_feature_cols, *load_columns]))
+
         try:
-            # Load features from DuckDB table
-            features_df = self.load_features(features_table)
+            features_df = self.load_features(
+                features_table,
+                columns=load_columns,
+                filter_expr=filter_expr,
+            )
 
-            # Ensure both DataFrames are sorted by join_keys and timestamp for join_asof
-            # When using 'by' parameter, we need to sort by both join_keys and timestamp
-            # to avoid sortedness warnings and ensure correct join behavior
+            if feature_timestamp_col != timestamp_col:
+                features_df = features_df.rename({feature_timestamp_col: timestamp_col})
+
             sort_cols = join_keys + [timestamp_col] if join_keys else [timestamp_col]
             labels_sorted = labels.sort(sort_cols)
             features_sorted = features_df.sort(sort_cols)
 
-            # Perform point-in-time join using Polars' join_asof
-            # Strategy: backward (take most recent feature <= label timestamp)
-            # Note: Polars warns about sortedness verification when using 'by' parameter
-            # but we explicitly sorted above, so we suppress this warning
             with warnings.catch_warnings():
                 warnings.filterwarnings(
                     "ignore",
@@ -516,9 +666,9 @@ class OfflineFeatureStore:
                 result = labels_sorted.join_asof(
                     features_sorted,
                     on=timestamp_col,
-                    by=join_keys,  # Additional join keys (e.g., symbol)
-                    strategy="backward",  # Most recent feature <= label timestamp
-                    tolerance=tolerance,  # Optional time window
+                    by=join_keys or None,
+                    strategy="backward",
+                    tolerance=tolerance,
                 )
 
             return result
@@ -527,6 +677,19 @@ class OfflineFeatureStore:
             raise FeatureStoreError(
                 f"Failed to perform point-in-time join with '{features_table}': {e}"
             ) from e
+
+    def _validate_table_exists(self, table_name: str, *, label: str) -> None:
+        _validate_table_name(table_name)
+        if not self.table_exists(table_name):
+            raise FeatureStoreError(
+                f"{label.capitalize()} table '{table_name}' does not exist. "
+                f"Available tables: {self.list_tables()}"
+            )
+
+    def _table_columns(self, table_name: str) -> list[str]:
+        self._validate_table_exists(table_name, label="table")
+        result = self.connection.execute(f"DESCRIBE {_quote_identifier(table_name)}").fetchall()
+        return [row[0] for row in result]
 
     def __repr__(self) -> str:
         """String representation of feature store."""
